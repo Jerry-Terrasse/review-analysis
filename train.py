@@ -132,8 +132,10 @@ def evaluate(net, val_loader, loss, device):
     net.eval()
     losses = []
     results = []
-    predicts = []
-    realitys = []
+    predicts, pred_level = [], []
+    realitys, real_level = [], []
+    def discriminator(x):
+        return round(x * 10)
     for X, Y in val_loader:
         state = net.begin_state(device, batch_size=X.shape[0])
         X, Y = X.to(device), Y.to(device)
@@ -148,15 +150,19 @@ def evaluate(net, val_loader, loss, device):
         results.append((predict, reality))
         predicts.append(predict)
         realitys.append(reality)
+        pred_level.append(discriminator(predict))
+        real_level.append(discriminator(reality))
     logger.info(f'Predict: {predicts[: 4]}')
     logger.info(f'Reality: {realitys[: 4]}')
-    return sum(losses) / len(losses)
+    correct = sum([1 if x == y else 0 for x, y in zip(pred_level, real_level)])
+    acc = correct / len(pred_level)
+    return sum(losses) / len(losses), acc
 
 def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
     loss = nn.MSELoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     
-    val_loss = evaluate(net, val_loader, loss, device)
+    val_loss, acc = evaluate(net, val_loader, loss, device)
     logger.info(f'Initial val loss: {val_loss:.6f}')
     
     loss_list: list[float] = []
@@ -187,8 +193,9 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
         optimizer.step()
         
         logger.info(f'Epoch {epoch} loss: {l_sum.item() / len(train_loader):.6f}')
-        val_loss = evaluate(net, val_loader, loss, device)
+        val_loss, val_acc = evaluate(net, val_loader, loss, device)
         logger.info(f'Epoch {epoch} val loss: {val_loss:.6f}')
+        logger.success(f'Epoch {epoch} val acc: {val_acc*100:.2f}%')
         
         loss_list.append(l_sum.item() / len(train_loader))
         val_loss_list.append(val_loss)
@@ -242,7 +249,7 @@ def main():
 
     net.to(device)
     
-    train(net, train_loader, test_loader, 0.02, 100, device)
+    train(net, train_loader, test_loader, 0.02, 200, device)
 
 
 if __name__ == "__main__":
