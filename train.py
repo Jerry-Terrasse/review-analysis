@@ -7,6 +7,7 @@ from torch.nn import functional as F
 import glob
 import time
 import json
+import pickle
 
 from typing import Callable
 from collections import Counter
@@ -16,6 +17,7 @@ from tqdm import tqdm
 logger.remove()
 logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
 
+from utils import Glove, plot_loss
 
 class Review:
     def __init__(self, quote: str, score: float) -> None:
@@ -28,59 +30,64 @@ class Review:
 '''
 
 class TomatoDataset(Dataset):
-    def __init__(self, root_dir: str):
-        self.root_dir = root_dir
-        self.files = glob.glob(root_dir + '/*.json')
-        self.data: list[Review] = []
-        self.counter = Counter()
-        for fname in self.files:
-            with open(fname) as f:
-                try:
-                    data: dict[str, dict] = json.load(f)
-                except json.JSONDecodeError:
-                    logger.warning(f'Failed to load {fname}')
-                    continue
-            for _, item in data.items():
-                assert item['rating'] == item['score']
-                rating = item['rating']
-                quote = item['quote']
-                
-                if self.counter[rating] > 200: # TEMP
-                    continue
-                self.counter[rating] += 1
-                
-                review = Review(quote, rating)
-                if review.isacii:
-                    self.data.append(review)
-        logger.info(f"{self.counter}")
-        logger.info(f'Loaded {len(self.data)} reviews')
+    def __init__(self, data: str):
+        data = json.load(open(data, 'r'))
+        self.scores: list[float] = list(map(lambda x: x[0], data))
+        self.quotes: list[list[str]] = list(map(lambda x: x[1].split(), data))
+        
+        logger.info(f'Loading Glove...')
+        glove_path = './pretrain/glove.6B.100d.txt'
+        glove_cache = glove_path + '.cache.json'
+        if glob.glob(glove_cache):
+            logger.info(f'Loading Glove from cache')
+            self.glove = Glove(glove_cache, 100, cache=True)
+        else:
+            self.glove = Glove(glove_path, 100)
+            self.glove.dump(glove_cache)
+        logger.info(f'Loaded Glove')
+        
+        self.words = Counter()
+        for quote in self.quotes:
+            self.words.update(quote)
+        
+        for word, cnt in self.words.items():
+            if word not in self.glove.word2idx and cnt > 5:
+                logger.warning(f'Word {word} not in glove, which appears {cnt} times')
+        
+        # self.counter = Counter(self.data)
+        # logger.info(f"{self.counter}")
+        self.cache: dict[int, torch.Tensor] = {}
+        logger.info(f'Loaded {len(self.quotes)} reviews')
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.scores)
     
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
-        review = self.data[idx]
-        quote, score = review.quote, review.score
-        quote_ = np.frombuffer(quote.encode('ascii', 'ignore'), dtype=np.uint8)
-        quote_ = torch.from_numpy(quote_.copy())
-        score_ = torch.tensor(score / 5)
-        # score_ = torch.rand(())
-        return quote_, score_
+        score_ = torch.tensor(self.scores[idx] / 5)
+        if idx in self.cache:
+            return self.cache[idx], score_
+        
+        quote = self.quotes[idx]
+        
+        tokens = list(map(lambda x: self.glove.word2idx.get(x, 0), quote))
+        tokens_ = torch.tensor(tokens)
+        self.cache[idx] = tokens_
+        
+        return tokens_, score_
 
 class Net(nn.Module):
-    def __init__(self, vocab_size=256, num_hidden=128, num_layers=2):
+    def __init__(self, pre_trained: list[torch.Tensor], num_hidden=128, num_layers=2):
         super().__init__()
-        self.vocab_size = vocab_size
         self.num_hidden = num_hidden
         self.num_layers = num_layers
-        self.pre_encode = nn.Linear(vocab_size, num_hidden)
-        self.lstm = nn.RNN(num_hidden, num_hidden, num_layers)
+        
+        embed_matrix = torch.stack(pre_trained, dim=0)
+        self.embedding = nn.Embedding.from_pretrained(embed_matrix)
+        self.lstm = nn.RNN(embed_matrix.shape[-1], num_hidden, num_layers)
         self.linear = nn.Linear(num_hidden, 1)
     
     def forward(self, inputs, state):
-        X = F.one_hot(inputs.T.long(), self.vocab_size)
-        X = X.float()
-        X = self.pre_encode(X)
+        X = self.embedding(inputs.T)
         Y, state = self.lstm(X, state)
         output = self.linear(Y)
         output = torch.sigmoid(output)
@@ -127,10 +134,13 @@ def evaluate(net, val_loader, loss, device):
 
 def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
     loss = nn.MSELoss()
-    optimizer = torch.optim.SGD(net.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     
     val_loss = evaluate(net, val_loader, loss, device)
     logger.info(f'Initial val loss: {val_loss:.6f}')
+    
+    loss_list: list[float] = []
+    val_loss_list: list[float] = []
     
     for epoch in tqdm(range(num_epochs)):
         net.train()
@@ -159,12 +169,16 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
         logger.info(f'Epoch {epoch} loss: {l_sum.item() / len(train_loader):.6f}')
         val_loss = evaluate(net, val_loader, loss, device)
         logger.info(f'Epoch {epoch} val loss: {val_loss:.6f}')
+        
+        loss_list.append(l_sum.item() / len(train_loader))
+        val_loss_list.append(val_loss)
+        plot_loss(loss_list, 'loss.png')
         if epoch % 10 == 0:
             torch.save(net.state_dict(), f'./ckpts/model_{epoch}.pt')
 
 @logger.catch(reraise=True)
 def main():
-    dataset_path = "./theater"
+    dataset_path = './theater_eng.json'
     dataset = TomatoDataset(dataset_path)
     if len(dataset) < 100:
         logger.warning(f"Too few data: {len(dataset)}")
@@ -179,10 +193,10 @@ def main():
 
     # logger.debug(next(iter(train_loader))[0])
 
-    vocab_size, num_hidden, num_layers = 256, 30, 1
+    num_hidden, num_layers = 128, 1
     device = 'cuda:0'
 
-    net = Net(vocab_size, num_hidden, num_layers)
+    net = Net(dataset.glove.idx2vec, num_hidden, num_layers)
 
     for m in net.modules():
         if isinstance(m, nn.Linear):
@@ -191,10 +205,20 @@ def main():
             for param in m.parameters():
                 if len(param.shape) >= 2:
                     nn.init.xavier_uniform_(param)
+        elif isinstance(m, nn.RNN):
+            for param in m.parameters():
+                if len(param.shape) >= 2:
+                    nn.init.xavier_uniform_(param)
+        elif isinstance(m, nn.Embedding):
+            nn.init.xavier_uniform_(m.weight)
+        elif isinstance(m, Net):
+            pass
+        else:
+            logger.warning(f'Not initialized: {m.__class__.__name__}')
 
     net.to(device)
     
-    train(net, train_loader, test_loader, 0.03, 100, device)
+    train(net, train_loader, test_loader, 0.1, 100, device)
 
 
 if __name__ == "__main__":

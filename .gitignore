@@ -164,6 +164,7 @@ cython_debug/
 *.zip
 data/
 theater
+home
 
 # Train
 ckpts/
@@ -173,3 +174,6 @@ ckpts/
 
 # VS Code
 .vscode/
+
+# Pre Train
+pretrain/
