@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn, Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn import functional as F
 
 import glob
@@ -17,7 +17,7 @@ from tqdm import tqdm
 logger.remove()
 logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
 
-from utils import Glove, plot_loss
+from utils import Glove, plot_loss, plot_hist
 
 class Review:
     def __init__(self, quote: str, score: float) -> None:
@@ -30,10 +30,30 @@ class Review:
 '''
 
 class TomatoDataset(Dataset):
-    def __init__(self, data: str):
-        data = json.load(open(data, 'r'))
+    def __init__(self, data_file: str):
+        data = json.load(open(data_file, 'r'))
+        
+        # to balance the dataset
+        scores = list(map(lambda x: x[0], data))
+        counter = Counter(scores)
+        p_list = np.array([1 / counter[score] for score in counter])
+        score2idx = {score: idx for idx, score in enumerate(counter)}
+        p_list /= p_list.sum()
+        data, data_ = [], data
+        for _ in range(10):
+            for item in data_:
+                if np.random.rand() < p_list[score2idx[item[0]]]:
+                    data.append(item)
+        
         self.scores: list[float] = list(map(lambda x: x[0], data))
         self.quotes: list[list[str]] = list(map(lambda x: x[1].split(), data))
+        plot_hist([len(x) for x in self.quotes], bins=range(0, 600, 20), fname='hist.png')
+        
+        counter = Counter(self.scores)
+        logger.info(f'Counter: {counter}')
+        
+        self.cache: dict[int, torch.Tensor] = {}
+        logger.info(f'Loaded {len(self.quotes)} reviews')
         
         logger.info(f'Loading Glove...')
         glove_path = './pretrain/glove.6B.100d.txt'
@@ -53,11 +73,6 @@ class TomatoDataset(Dataset):
         for word, cnt in self.words.items():
             if word not in self.glove.word2idx and cnt > 5:
                 logger.warning(f'Word {word} not in glove, which appears {cnt} times')
-        
-        # self.counter = Counter(self.data)
-        # logger.info(f"{self.counter}")
-        self.cache: dict[int, torch.Tensor] = {}
-        logger.info(f'Loaded {len(self.quotes)} reviews')
 
     def __len__(self) -> int:
         return len(self.scores)
@@ -83,22 +98,27 @@ class Net(nn.Module):
         
         embed_matrix = torch.stack(pre_trained, dim=0)
         self.embedding = nn.Embedding.from_pretrained(embed_matrix)
-        self.lstm = nn.RNN(embed_matrix.shape[-1], num_hidden, num_layers)
-        self.linear = nn.Linear(num_hidden, 1)
+        self.lstm = nn.LSTM(embed_matrix.shape[-1], num_hidden, num_layers)
+        
+        self.output = nn.Sequential(
+            nn.Linear(num_hidden, 1),
+            # nn.Tanh(),
+            # nn.Linear(30, 1),
+            nn.Sigmoid()
+        )
     
     def forward(self, inputs, state):
         X = self.embedding(inputs.T)
         Y, state = self.lstm(X, state)
-        output = self.linear(Y)
-        output = torch.sigmoid(output)
+        output = self.output(Y)
         return output, state
     
     def begin_state(self, device, batch_size=1):
-        return torch.zeros(self.num_layers, batch_size, self.num_hidden, device=device)
-        # return (
-        #     torch.zeros(self.num_layers, batch_size, self.num_hidden, device=device),
-        #     torch.zeros(self.num_layers, batch_size, self.num_hidden, device=device)
-        # )
+        # return torch.zeros(self.num_layers, batch_size, self.num_hidden, device=device)
+        return (
+            torch.zeros(self.num_layers, batch_size, self.num_hidden, device=device),
+            torch.zeros(self.num_layers, batch_size, self.num_hidden, device=device)
+        )
 
 def grad_clipping(net, theta):
     params = [p for p in net.parameters() if p.requires_grad]
@@ -142,7 +162,7 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
     loss_list: list[float] = []
     val_loss_list: list[float] = []
     
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in tqdm(range(1, num_epochs+1)):
         net.train()
         l_sum = torch.tensor(0., device=device)
         for X, Y in train_loader:
@@ -172,7 +192,7 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
         
         loss_list.append(l_sum.item() / len(train_loader))
         val_loss_list.append(val_loss)
-        plot_loss(loss_list, 'loss.png')
+        plot_loss(loss_list, 'loss_img/loss.png')
         if epoch % 10 == 0:
             torch.save(net.state_dict(), f'./ckpts/model_{epoch}.pt')
 
@@ -186,6 +206,10 @@ def main():
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_data, test_data = torch.utils.data.random_split(dataset, [train_size, test_size])
+    
+    # Weighted Sample
+    # TODO
+    
     train_loader, test_loader = DataLoader(train_data, batch_size=1), DataLoader(test_data, batch_size=1)
 
     logger.info(f'Train size: {len(train_loader)}')
@@ -209,8 +233,8 @@ def main():
             for param in m.parameters():
                 if len(param.shape) >= 2:
                     nn.init.xavier_uniform_(param)
-        elif isinstance(m, nn.Embedding):
-            nn.init.xavier_uniform_(m.weight)
+        # elif isinstance(m, nn.Embedding):
+        #     nn.init.xavier_uniform_(m.weight)
         elif isinstance(m, Net):
             pass
         else:
@@ -218,7 +242,7 @@ def main():
 
     net.to(device)
     
-    train(net, train_loader, test_loader, 0.1, 100, device)
+    train(net, train_loader, test_loader, 0.02, 100, device)
 
 
 if __name__ == "__main__":
