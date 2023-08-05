@@ -47,6 +47,16 @@ def plot_loss(loss: list[float], fname: str) -> None:
     plt.savefig(fname)
     plt.close()
 
+def plot_multi_loss(loss: list[list[float]], labels: list[str], fname: str) -> None:
+    plt.figure()
+    for i in range(len(loss)):
+        plt.plot(loss[i], label = labels[i])
+    plt.ylabel('loss')
+    plt.xlabel('epoch')
+    plt.legend()
+    plt.savefig(fname)
+    plt.close()
+
 def plot_hist(data: list[int], bins: list, fname: str) -> None:
     plt.figure()
     plt.hist(data, bins=bins)
