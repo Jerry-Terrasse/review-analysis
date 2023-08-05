@@ -19,7 +19,7 @@ from tqdm import tqdm
 logger.remove()
 logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
 
-from utils import Glove, plot_loss, plot_hist
+from utils import Glove, plot_loss, plot_hist, plot_multi_loss
 
 class Review:
     def __init__(self, quote: str, score: float) -> None:
@@ -31,11 +31,11 @@ class Review:
 {self.review}
 '''
 
-def cut_or_pad(quote: list[str], length: int) -> list[str]:
+def cut_or_pad(quote: list[int], length: int, pad: int) -> list[str]:
     if len(quote) > length:
         return quote[:length]
     else:
-        return quote + ['<pad>'] * (length - len(quote))
+        return quote + [pad] * (length - len(quote))
 
 class TomatoDataset(Dataset):
     def __init__(self, data_file: str):
@@ -60,7 +60,7 @@ class TomatoDataset(Dataset):
         counter = Counter(self.scores)
         logger.info(f'Counter: {counter}')
         
-        self.cache: dict[int, torch.Tensor] = {}
+        self.cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         logger.info(f'Loaded {len(self.quotes)} reviews')
         
         logger.info(f'Loading Glove...')
@@ -70,7 +70,7 @@ class TomatoDataset(Dataset):
             logger.info(f'Loading Glove from cache')
             self.glove = Glove(glove_cache, 100, cache=True)
         else:
-            self.glove = Glove(glove_path, 100)
+            self.glove = Glove(glove_path, 100, reserved=['<pad>', '<bos>', '<eos>'])
             self.glove.dump(glove_cache)
         logger.info(f'Loaded Glove')
         
@@ -85,19 +85,20 @@ class TomatoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.scores)
     
-    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor]:
         score_ = torch.tensor(self.scores[idx] / 5)
         if idx in self.cache:
-            return self.cache[idx], score_
+            return *self.cache[idx], score_
         
         quote = self.quotes[idx]
-        quote = cut_or_pad(quote, 100)
         
         tokens = list(map(lambda x: self.glove.word2idx.get(x, 0), quote))
+        tokens = cut_or_pad(tokens, 100, self.glove.word2idx['<pad>'])
         tokens_ = torch.tensor(tokens)
-        self.cache[idx] = tokens_
+        valid_len = (tokens_ != self.glove.word2idx['<pad>']).long().sum()
+        self.cache[idx] = tokens_, valid_len
         
-        return tokens_, score_
+        return tokens_, valid_len, score_
 
 def sequence_mask(X, valid_len, value=0):
     """Mask irrelevant entries in sequences.
@@ -176,13 +177,13 @@ class Net(nn.Module):
             nn.Sigmoid()
         )
     
-    def forward(self, X):
+    def forward(self, X, valid_lens):
         enc_output, state = self.encoder(X)
         # enc_output: (S, B, H)
         # state: (L, B, H)
         query = state[-1].unsqueeze(1) # (B, 1, H)
         enc_output = enc_output.permute(1, 0, 2) # (B, S, H)
-        output = self.attention(query, enc_output, enc_output)
+        output = self.attention(query, enc_output, enc_output, valid_lens)
         # output: (B, 1, H)
         Y = self.output(output.squeeze(1))
         return Y
@@ -228,7 +229,7 @@ def grad_clipping(net, theta):
         for param in params:
             param.grad[:] *= theta / norm
 
-def evaluate(net, val_loader, loss, device):
+def evaluate(net, val_loader, loss, device, idx2word: list[str] = None):
     net.eval()
     losses = []
     results = []
@@ -236,9 +237,12 @@ def evaluate(net, val_loader, loss, device):
     realitys, real_level = [], []
     def discriminator(x):
         return round(x * 10)
-    for X, Y in val_loader:
-        X, Y = X.to(device), Y.to(device)
-        y_hat = net(X)
+    texts = []
+    assert idx2word is not None
+    for X, valid_lens, Y in val_loader:
+        text = [' '.join(idx2word[word.item()] for word in seq) for seq in X]
+        X, valid_lens, Y = X.to(device), valid_lens.to(device), Y.to(device)
+        y_hat = net(X, valid_lens)
         
         l = loss(Y, y_hat.reshape(-1))
         losses.append(l.mean().item())
@@ -250,19 +254,30 @@ def evaluate(net, val_loader, loss, device):
         realitys.extend(reality)
         pred_level.extend([discriminator(x) for x in predict])
         real_level.extend([discriminator(x) for x in reality])
+        
+        texts.extend(text)
     logger.info(f'Predict: {predicts[: 4]}')
     logger.info(f'Reality: {realitys[: 4]}')
     correct = sum([1 if x == y else 0 for x, y in zip(pred_level, real_level)])
     correct2 = sum([1 if abs(x - y) <= 1 else 0 for x, y in zip(pred_level, real_level)])
+    
+    cls_p = [int(lvl/3.4) for lvl in pred_level]
+    cls_r = [int(lvl/3.4) for lvl in real_level]
+    correct3 = sum([1 if x == y else 0 for x, y in zip(cls_p, cls_r)])
+    
     acc = correct / len(pred_level)
     acc2 = correct2 / len(pred_level)
-    return sum(losses) / len(losses), [acc, acc2]
+    acc3 = correct3 / len(pred_level)
+    
+    items = [(p, r, t) for p, r, t in zip(pred_level, real_level, texts)]
+    json.dump(items, open('items.json', 'w'), indent=4)
+    return sum(losses) / len(losses), [acc, acc2, acc3]
 
-def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
+def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0', idx2word: list[str] = None):
     loss = nn.MSELoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
     
-    val_loss, acc = evaluate(net, val_loader, loss, device)
+    val_loss, acc = evaluate(net, val_loader, loss, device, idx2word)
     logger.info(f'Initial val loss: {val_loss:.6f}')
     
     loss_list: list[float] = []
@@ -271,9 +286,9 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
     for epoch in tqdm(range(1, num_epochs+1)):
         net.train()
         losses = []
-        for X, Y in train_loader:
-            X, Y = X.to(device), Y.to(device)
-            y_hat = net(X)
+        for X, valid_lens, Y in train_loader:
+            X, valid_lens, Y = X.to(device), valid_lens.to(device), Y.to(device)
+            y_hat = net(X, valid_lens)
             l = loss(Y, y_hat.reshape(-1))
             # logger.debug(Y)
             # logger.debug(f"Y {Y.norm()} y_hat {y_hat.norm()} loss {l.item()}")
@@ -287,13 +302,13 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0'):
             losses.append(l.mean().item())
         
         logger.info(f'Epoch {epoch} loss: {sum(losses) / len(losses):.6f}')
-        val_loss, val_acc = evaluate(net, val_loader, loss, device)
+        val_loss, val_acc = evaluate(net, val_loader, loss, device, idx2word)
         logger.info(f'Epoch {epoch} val loss: {val_loss:.6f}')
-        logger.success(f'Epoch {epoch} val acc: {val_acc[0]*100:.2f}% {val_acc[1]*100:.2f}%')
+        logger.success(f'Epoch {epoch} val acc: {val_acc[0]*100:.2f}% {val_acc[1]*100:.2f}% {val_acc[2]*100:.2f}%')
         
         loss_list.append(sum(losses) / len(losses))
         val_loss_list.append(val_loss)
-        plot_loss(loss_list, 'loss_img/loss.png')
+        plot_multi_loss([loss_list, val_loss_list], ['train', 'val'], 'loss.png')
         if epoch % 10 == 0:
             torch.save(net.state_dict(), f'./ckpts/model_{epoch}.pt')
 
@@ -322,7 +337,7 @@ def main():
     num_hidden, num_layers = 128, 4
     device = 'cuda:0'
 
-    net = Net(dataset.glove.idx2vec, num_hidden, num_layers)
+    net = Net(dataset.glove.idx2vec, num_hidden, num_layers, 0.1)
 
     for m in net.modules():
         if isinstance(m, nn.Linear):
@@ -344,7 +359,7 @@ def main():
 
     net.to(device)
     
-    train(net, train_loader, test_loader, 0.001, 300, device)
+    train(net, train_loader, test_loader, 0.001, 300, device, dataset.glove.idx2word)
 
 
 if __name__ == "__main__":

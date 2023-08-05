@@ -3,7 +3,7 @@ import json
 from matplotlib import pyplot as plt
 
 class Glove:
-    def __init__(self, fname: str, dim: int, cache: bool = False) -> None:
+    def __init__(self, fname: str, dim: int, cache: bool = False, reserved: list[str] = []) -> None:
         self.dim = dim
         self.word2idx: dict[str, int] = {'<ukn>': 0}
         self.idx2word: list[str] = ['<ukn>']
@@ -12,6 +12,11 @@ class Glove:
         if cache:
             self.load(fname)
             return
+        for word in reserved:
+            self.word2idx[word] = len(self.idx2word)
+            self.idx2word.append(word)
+            self.idx2vec.append(torch.zeros(dim))
+            self.idx2vec_.append([0] * dim)
         with open(fname, 'r') as f:
             for line in f:
                 word, *vector = line.split()
