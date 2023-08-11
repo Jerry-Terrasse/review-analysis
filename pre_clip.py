@@ -8,9 +8,9 @@ with open(fname) as f:
 result = []
 for rating, quote in data:
     quote = quote.split()
-    for i in range(len(quote) // 100 + 1):
-        piece = quote[i*100: (i+1)*100]
-        if len(piece) < 50:
+    for i in range(len(quote) // 200 + 1):
+        piece = quote[i*200: (i+1)*200]
+        if len(piece) < 100:
             break
         result.append((rating, ' '.join(piece)))
 

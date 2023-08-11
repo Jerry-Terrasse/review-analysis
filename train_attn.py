@@ -37,42 +37,46 @@ def cut_or_pad(quote: list[int], length: int, pad: int) -> list[str]:
     else:
         return quote + [pad] * (length - len(quote))
 
+def load_glove() -> Glove:
+    logger.info(f'Loading Glove...')
+    glove_path = './pretrain/glove.6B.100d.txt'
+    glove_cache = glove_path + '.cache.json'
+    if glob.glob(glove_cache):
+        logger.info(f'Loading Glove from cache')
+        glove = Glove(glove_cache, 100, cache=True)
+    else:
+        glove = Glove(glove_path, 100, reserved=['<pad>', '<bos>', '<eos>'])
+        glove.dump(glove_cache)
+    logger.info(f'Loaded Glove')
+    return glove
+
 class TomatoDataset(Dataset):
-    def __init__(self, data_file: str):
+    def __init__(self, data_file: str, glove_: Glove):
         data = json.load(open(data_file, 'r'))
         
         # to balance the dataset
-        scores = list(map(lambda x: x[0], data))
-        counter = Counter(scores)
-        p_list = np.array([1 / counter[score] for score in counter])
-        score2idx = {score: idx for idx, score in enumerate(counter)}
-        p_list /= p_list.sum()
-        data, data_ = [], data
-        for _ in range(10):
-            for item in data_:
-                if np.random.rand() < p_list[score2idx[item[0]]]:
-                    data.append(item)
+        # scores = list(map(lambda x: x[0], data))
+        # counter = Counter(scores)
+        # p_list = np.array([1 / counter[score] for score in counter])
+        # score2idx = {score: idx for idx, score in enumerate(counter)}
+        # p_list /= p_list.sum()
+        # data, data_ = [], data
+        # for _ in range(10):
+        #     for item in data_:
+        #         if np.random.rand() < p_list[score2idx[item[0]]]:
+        #             data.append(item)
         
         self.scores: list[float] = list(map(lambda x: x[0], data))
         self.quotes: list[list[str]] = list(map(lambda x: x[1].split(), data))
         plot_hist([len(x) for x in self.quotes], bins=range(0, 600, 20), fname='hist.png')
         
-        counter = Counter(self.scores)
-        logger.info(f'Counter: {counter}')
+        self.counter = Counter(self.scores)
+        logger.info(f'Counter: {self.counter}')
         
         self.cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         logger.info(f'Loaded {len(self.quotes)} reviews')
         
-        logger.info(f'Loading Glove...')
-        glove_path = './pretrain/glove.6B.100d.txt'
-        glove_cache = glove_path + '.cache.json'
-        if glob.glob(glove_cache):
-            logger.info(f'Loading Glove from cache')
-            self.glove = Glove(glove_cache, 100, cache=True)
-        else:
-            self.glove = Glove(glove_path, 100, reserved=['<pad>', '<bos>', '<eos>'])
-            self.glove.dump(glove_cache)
-        logger.info(f'Loaded Glove')
+        self.glove = glove_
         
         self.words = Counter()
         for quote in self.quotes:
@@ -314,20 +318,21 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0', idx2wo
 
 @logger.catch(reraise=True)
 def main():
-    dataset_path = './home_eng_clip.json'
-    # dataset_path = './theater_eng_clip.json'
-    dataset = TomatoDataset(dataset_path)
-    if len(dataset) < 100:
-        logger.warning(f"Too few data: {len(dataset)}")
+    glove = load_glove()
+    
+    train_data_path = 'home_eng_clip_train.json'
+    test_data_path = 'home_eng_clip_test.json'
+    train_data = TomatoDataset(train_data_path, glove)
+    test_data = TomatoDataset(test_data_path, glove)
+    if len(train_data) < 100:
+        logger.warning(f"Too few data: {len(train_data)}")
 
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_data, test_data = torch.utils.data.random_split(dataset, [train_size, test_size])
+    weights = {rating: len(train_data)/cnt for rating, cnt in train_data.counter.items()}
+    weights = [weights[rating] for rating in train_data.scores]
+    weights = torch.DoubleTensor(weights)
+    sampler = WeightedRandomSampler(weights, len(weights))
     
-    # Weighted Sample
-    # TODO
-    
-    train_loader, test_loader = DataLoader(train_data, batch_size=128), DataLoader(test_data, batch_size=128)
+    train_loader, test_loader = DataLoader(train_data, batch_size=128, sampler=sampler), DataLoader(test_data, batch_size=128, shuffle=False)
 
     logger.info(f'Train size: {len(train_loader)}')
     logger.info(f'Test size: {len(test_loader)}')
@@ -337,7 +342,7 @@ def main():
     num_hidden, num_layers = 128, 4
     device = 'cuda:0'
 
-    net = Net(dataset.glove.idx2vec, num_hidden, num_layers, 0.1)
+    net = Net(glove.idx2vec, num_hidden, num_layers, 0.4)
 
     for m in net.modules():
         if isinstance(m, nn.Linear):
@@ -359,7 +364,7 @@ def main():
 
     net.to(device)
     
-    train(net, train_loader, test_loader, 0.001, 300, device, dataset.glove.idx2word)
+    train(net, train_loader, test_loader, 0.001, 300, device, glove.idx2word)
 
 
 if __name__ == "__main__":
