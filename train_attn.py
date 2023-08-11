@@ -97,7 +97,7 @@ class TomatoDataset(Dataset):
         quote = self.quotes[idx]
         
         tokens = list(map(lambda x: self.glove.word2idx.get(x, 0), quote))
-        tokens = cut_or_pad(tokens, 100, self.glove.word2idx['<pad>'])
+        tokens = cut_or_pad(tokens, 200, self.glove.word2idx['<pad>'])
         tokens_ = torch.tensor(tokens)
         valid_len = (tokens_ != self.glove.word2idx['<pad>']).long().sum()
         self.cache[idx] = tokens_, valid_len
@@ -312,6 +312,7 @@ def train(net, train_loader, val_loader, lr, num_epochs, device='cuda:0', idx2wo
         
         loss_list.append(sum(losses) / len(losses))
         val_loss_list.append(val_loss)
+        # plot_loss(loss_list, 'loss.png')
         plot_multi_loss([loss_list, val_loss_list], ['train', 'val'], 'loss.png')
         if epoch % 10 == 0:
             torch.save(net.state_dict(), f'./ckpts/model_{epoch}.pt')
@@ -342,7 +343,7 @@ def main():
     num_hidden, num_layers = 128, 4
     device = 'cuda:0'
 
-    net = Net(glove.idx2vec, num_hidden, num_layers, 0.4)
+    net = Net(glove.idx2vec, num_hidden, num_layers, 0.1)
 
     for m in net.modules():
         if isinstance(m, nn.Linear):
