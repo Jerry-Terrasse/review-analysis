@@ -165,6 +165,7 @@ cython_debug/
 data/
 theater
 home
+*.png
 
 # Train
 ckpts/

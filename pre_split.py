@@ -23,4 +23,4 @@ for rating, quotes in results.items():
     test_data.extend(quotes[cut:])
 
 json.dump(train_data, open(fname[:-5] + '_train.json', 'w'), indent=4)
-json.dump(test_data, open(fname[:-5] + '_test.json', 'w'), indent=4)
+json.dump(test_data, open(fname[:-5] + '_eval.json', 'w'), indent=4)

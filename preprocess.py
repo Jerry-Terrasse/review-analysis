@@ -18,12 +18,13 @@ if __name__ == '__main__':
             data: dict[str, dict] = json.load(f)
         for _, item in data.items():
             rating = float(item['rating'])
-            quote = clean(item['quote'])
+            quote = item['quote']
+            # quote = clean(item['quote'])
             
-            words = quote.split()
-            if len(words) < 5:
-                continue
-            quote = ' '.join(words)
+            # words = quote.split()
+            # if len(words) < 5:
+            #     continue
+            # quote = ' '.join(words)
             clean_data.append((rating, quote))
 
-    json.dump(clean_data, open('home_eng.json', 'w'), indent=4)
+    json.dump(clean_data, open('home.json', 'w'), indent=4)
